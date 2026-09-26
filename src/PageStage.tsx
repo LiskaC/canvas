@@ -1,5 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { fontStack, PAGE_H, PAGE_NAMES, PAGE_W, PT_TO_MM, round1, SAFE_MARGIN, type FlyerEl, type Page } from './flyer'
+import { RichEditor, RunSpans, type TextSel } from './RichText'
 
 type Handle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
 const IMAGE_HANDLES: Handle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w']
@@ -7,9 +8,13 @@ const IMAGE_HANDLES: Handle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w']
 const TEXT_HANDLES: Handle[] = ['e', 'se', 'sw', 'w']
 const SNAP_MM = 1.5
 
+/** How far a text box's background reaches past its text, in mm. */
+const pad = (el: FlyerEl) => (el.type === 'text' && el.fill ? (el.padding ?? 0) : 0)
+
 interface Props {
   page: Page
   index: number
+  pageCount: number
   scale: number
   active: boolean
   selectedId: string | null
@@ -21,6 +26,9 @@ interface Props {
   onCheckpoint: () => void
   onStartEdit: (id: string) => void
   onEndEdit: () => void
+  textSel: TextSel | null
+  onTextSel: (sel: TextSel) => void
+  onUndo: (redo: boolean) => void
   onDropFiles: (files: File[], xMm: number, yMm: number) => void
 }
 
@@ -37,9 +45,10 @@ export default function PageStage(props: Props) {
     const node = nodes.current.get(selected.id)
     if (!node) return
     const ro = new ResizeObserver(() => setTextH(node.offsetHeight / s))
-    ro.observe(node)
+    ro.observe(node, { box: 'border-box' }) // padding changes must update the frame too
     return () => ro.disconnect()
-  }, [selected?.id, selected?.type, s])
+    // The text node is replaced when editing starts or stops, so observe the new one.
+  }, [selected?.id, selected?.type, s, editingId])
 
   function startDrag(e: ReactPointerEvent, el: FlyerEl, handle: Handle | null) {
     if (e.button !== 0) return
@@ -48,7 +57,7 @@ export default function PageStage(props: Props) {
     const startX = e.clientX
     const startY = e.clientY
     const node = nodes.current.get(el.id)
-    const h = el.type === 'image' ? el.h : (node?.offsetHeight ?? 0) / s
+    const h = el.type === 'image' ? el.h : (node?.offsetHeight ?? 0) / s - pad(el) * 2
     let moved = false
 
     const onMove = (ev: PointerEvent) => {
@@ -131,7 +140,8 @@ export default function PageStage(props: Props) {
     <div className={'page-wrap' + (props.active ? ' is-active' : '')}>
       <button type="button" className="page-label" onClick={props.onActivate}>
         <span className="page-label-name">
-          Page {index + 1} · {PAGE_NAMES[index]}
+          Page {index + 1}
+          {props.pageCount > 1 && ` · ${PAGE_NAMES[index]}`}
         </span>
         <span className="page-label-size">105 × 148 mm</span>
       </button>
@@ -189,9 +199,11 @@ export default function PageStage(props: Props) {
                 className={'el el-text' + (editing ? ' is-editing' : '')}
                 onDoubleClick={() => props.onStartEdit(el.id)}
                 style={{
-                  left: el.x * s,
-                  top: el.y * s,
-                  width: el.w * s,
+                  left: (el.x - pad(el)) * s,
+                  top: (el.y - pad(el)) * s,
+                  width: (el.w + pad(el) * 2) * s,
+                  padding: pad(el) * s,
+                  background: el.fill,
                   fontFamily: fontStack(el.font),
                   fontSize: el.size * PT_TO_MM * s,
                   fontWeight: el.bold ? 700 : 400,
@@ -202,13 +214,17 @@ export default function PageStage(props: Props) {
                 }}
               >
                 {editing ? (
-                  <EditableText
-                    text={el.text}
-                    onText={(text) => props.onChange(el.id, { text })}
-                    onDone={props.onEndEdit}
+                  <RichEditor
+                    el={el}
+                    scale={s}
+                    sel={props.textSel}
+                    onRuns={(runs) => props.onChange(el.id, { runs })}
+                    onSelection={props.onTextSel}
+                    onExit={props.onEndEdit}
+                    onUndo={props.onUndo}
                   />
                 ) : (
-                  el.text || '​'
+                  <RunSpans el={el} scale={s} />
                 )}
               </div>
             )
@@ -242,7 +258,12 @@ export default function PageStage(props: Props) {
         {selected && (
           <div
             className="selection"
-            style={{ left: selected.x * s, top: selected.y * s, width: selected.w * s, height: selH * s }}
+            style={{
+              left: (selected.x - pad(selected)) * s,
+              top: (selected.y - pad(selected)) * s,
+              width: (selected.w + pad(selected) * 2) * s,
+              height: selH * s,
+            }}
           >
             {editingId !== selected.id &&
               (selected.type === 'image' ? IMAGE_HANDLES : TEXT_HANDLES).map((hd) => (
@@ -256,37 +277,5 @@ export default function PageStage(props: Props) {
         )}
       </div>
     </div>
-  )
-}
-
-function EditableText({ text, onText, onDone }: { text: string; onText: (t: string) => void; onDone: () => void }) {
-  const ref = useRef<HTMLSpanElement>(null)
-  // Uncontrolled while editing: React never rewrites the text under the caret.
-  useLayoutEffect(() => {
-    const n = ref.current
-    if (!n) return
-    n.textContent = text
-    n.focus()
-    const range = document.createRange()
-    range.selectNodeContents(n)
-    const sel = window.getSelection()
-    sel?.removeAllRanges()
-    sel?.addRange(range)
-    // Only on mount; later text changes come from this element itself.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-  return (
-    <span
-      ref={ref}
-      className="editable"
-      contentEditable="plaintext-only"
-      suppressContentEditableWarning
-      onInput={(e) => onText(e.currentTarget.innerText.replace(/\n$/, ''))}
-      onBlur={onDone}
-      onKeyDown={(e) => {
-        e.stopPropagation()
-        if (e.key === 'Escape') e.currentTarget.blur()
-      }}
-    />
   )
 }

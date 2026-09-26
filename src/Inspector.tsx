@@ -1,6 +1,8 @@
-import { useRef, useState, type ReactNode } from 'react'
-import type { LayerMove } from './App'
-import { FONTS, fontStack, PAGE_H, PAGE_NAMES, PAGE_W, round1, type Align, type Flyer, type FlyerEl } from './flyer'
+import { useRef, type ReactNode } from 'react'
+import type { LayerMove } from './Editor'
+import { FONTS, fontStack, PAGE_H, PAGE_NAMES, PAGE_W, round1, type Align, type Flyer, type FlyerEl, type TextEl, type TextStyle } from './flyer'
+import type { TextSel } from './RichText'
+import { clearKey, plainText, stylesInRange, type StyleKey, type StylePatch } from './runs'
 import { loadImage } from './render'
 
 const SWATCHES = ['#ffffff', '#fbf4e6', '#f2d7d0', '#d9e8d5', '#17324f', '#1b1f1d', '#c8166b', '#f28c28']
@@ -17,14 +19,23 @@ interface Props {
   onOtherSide: () => void
   onDuplicate: () => void
   onDelete: () => void
-  onStartOver: () => void
+  editing: boolean
+  textSel: TextSel | null // non-empty selection while editing text
+  onFormat: (patch: StylePatch, key: string) => void
+  onStartEdit: () => void
   onReplaceImage: (file: File) => void
 }
 
 export default function Inspector(props: Props) {
   const { selected: el } = props
   return (
-    <aside className="inspector" onPointerDown={(e) => e.stopPropagation()}>
+    <aside
+      className="inspector"
+      onMouseDown={(e) => {
+        // Keep focus (and the word selection) in the text being edited when a button is pressed.
+        if ((e.target as HTMLElement).closest('button')) e.preventDefault()
+      }}
+    >
       {!el && <PagePanel {...props} />}
       {el?.type === 'text' && <TextPanel {...props} />}
       {el?.type === 'image' && <ImagePanel {...props} />}
@@ -98,121 +109,194 @@ function ColorField({ id, label, value, onChange }: { id: string; label: string;
   )
 }
 
-function PagePanel({ flyer, activePage, onBackground, onStartOver }: Props) {
-  const [confirming, setConfirming] = useState(false)
+function PagePanel({ flyer, activePage, onBackground }: Props) {
   const page = flyer.pages[activePage]
+  const two = flyer.pages.length > 1
   return (
     <>
-      <Section title={`Page ${activePage + 1} · ${PAGE_NAMES[activePage]}`}>
+      <Section title={two ? `Page ${activePage + 1} · ${PAGE_NAMES[activePage]}` : 'Page'}>
         <ColorField
           id="page-bg"
           label="Background"
           value={page.background}
           onChange={(c) => onBackground(activePage, c)}
         />
-        <p className="hint">Click a page label to switch pages. New text and images go on the page you last clicked.</p>
+        {two && (
+          <p className="hint">Click a page label to switch pages. New text and images go on the page you last clicked.</p>
+        )}
       </Section>
       <Section title="How it works">
         <ul className="keys">
           <li><span>Drag</span> move an item; it snaps to the page centre (hold <kbd>Alt</kbd> to skip)</li>
           <li><span>Corners</span> resize; images keep their shape unless you hold <kbd>Shift</kbd></li>
-          <li><span>Double-click</span> text to type on the page</li>
-          <li><span>Drop</span> image files straight onto either page</li>
+          <li><span>Double-click</span> text to type on the page, then select words to format just those</li>
+          <li><span>Drop</span> image files straight onto a page</li>
           <li><kbd>←↑→↓</kbd> nudge 0.5 mm, with <kbd>Shift</kbd> 5 mm</li>
-          <li><kbd>⌘D</kbd> duplicate · <kbd>⌫</kbd> delete · <kbd>⌘Z</kbd> undo</li>
+          <li><kbd>⌘B</kbd> <kbd>⌘I</kbd> <kbd>⌘U</kbd> while typing · <kbd>⌘D</kbd> duplicate · <kbd>⌫</kbd> delete</li>
         </ul>
         <p className="hint">The dashed line marks a 4 mm safe margin. Printers may trim anything outside it.</p>
-      </Section>
-      <Section title="Flyer">
-        <p className="hint">Your flyer saves automatically in this browser.</p>
-        {confirming ? (
-          <div className="btn-row">
-            <button type="button" className="btn btn-danger" onClick={() => { onStartOver(); setConfirming(false) }}>
-              Clear both pages
-            </button>
-            <button type="button" className="btn btn-quiet" onClick={() => setConfirming(false)}>
-              Keep
-            </button>
-          </div>
-        ) : (
-          <button type="button" className="btn" onClick={() => setConfirming(true)}>
-            Start a blank flyer
-          </button>
-        )}
       </Section>
     </>
   )
 }
 
-function TextPanel({ selected, onPatch }: Props) {
+/** One value if every character agrees, otherwise null (mixed). */
+function common<K extends keyof TextStyle>(styles: TextStyle[], key: K): TextStyle[K] | null {
+  return styles.every((st) => st[key] === styles[0][key]) ? styles[0][key] : null
+}
+
+function TextPanel({ selected, editing, textSel, onPatch, onFormat, onStartEdit }: Props) {
   if (selected?.type !== 'text') return null
-  const el = selected
+  const el: TextEl = selected
+  const len = plainText(el.runs).length
+  const styles = textSel ? stylesInRange(el, textSel.start, textSel.end) : stylesInRange(el, 0, len)
+
+  /** Applies to the selected words, or to the whole box (clearing word-level overrides of that setting). */
+  function set<K extends StyleKey>(key: K, value: TextStyle[K]) {
+    if (textSel) onFormat({ [key]: value } as StylePatch, key)
+    else onPatch({ [key]: value, runs: clearKey(el.runs, key) } as Partial<TextEl>, key)
+  }
+
+  const toggles: { key: 'bold' | 'italic' | 'underline'; label: ReactNode }[] = [
+    { key: 'bold', label: <b>Bold</b> },
+    { key: 'italic', label: <i>Italic</i> },
+    { key: 'underline', label: <u>Underline</u> },
+  ]
   const aligns: { v: Align; label: string }[] = [
     { v: 'left', label: 'Left' },
     { v: 'center', label: 'Centre' },
     { v: 'right', label: 'Right' },
   ]
+  const font = common(styles, 'font')
+  const size = common(styles, 'size')
+  const color = common(styles, 'color')
+
   return (
-    <Section title="Text">
-      <div className="field">
-        <label className="field-label" htmlFor="text-content">Words</label>
-        <textarea
-          id="text-content"
-          rows={4}
-          value={el.text}
-          onChange={(e) => onPatch({ text: e.target.value }, 'text')}
-        />
-      </div>
-      <div className="field">
-        <label className="field-label" htmlFor="text-font">Typeface</label>
-        <select
-          id="text-font"
-          value={el.font}
-          style={{ fontFamily: fontStack(el.font) }}
-          onChange={(e) => onPatch({ font: e.target.value }, 'font')}
-        >
-          {FONTS.map((f) => (
-            <option key={f.family} value={f.family} style={{ fontFamily: fontStack(f.family) }}>
-              {f.family}
-            </option>
-          ))}
-        </select>
-      </div>
-      <div className="grid2">
-        <NumField id="text-size" label="Size" unit="pt" step={1} min={4} value={el.size} onChange={(n) => onPatch({ size: Math.max(4, n) }, 'size')} />
-        <NumField id="text-lh" label="Line spacing" unit="×" step={0.05} min={0.7} value={el.lineHeight} onChange={(n) => onPatch({ lineHeight: Math.max(0.7, n) }, 'lh')} />
-      </div>
-      <div className="field">
-        <span className="field-label">Style</span>
-        <div className="seg">
-          <button type="button" className={'seg-btn' + (el.bold ? ' is-on' : '')} aria-pressed={el.bold} onClick={() => onPatch({ bold: !el.bold }, 'bold')}>
-            <b>Bold</b>
-          </button>
-          <button type="button" className={'seg-btn' + (el.italic ? ' is-on' : '')} aria-pressed={el.italic} onClick={() => onPatch({ italic: !el.italic }, 'italic')}>
-            <i>Italic</i>
-          </button>
-        </div>
-      </div>
-      <div className="field">
-        <span className="field-label">Align</span>
-        <div className="seg">
-          {aligns.map((a) => (
-            <button key={a.v} type="button" className={'seg-btn' + (el.align === a.v ? ' is-on' : '')} aria-pressed={el.align === a.v} onClick={() => onPatch({ align: a.v }, 'align')}>
-              {a.label}
+    <>
+      <Section title={textSel ? 'Selected words' : 'Text'}>
+        {textSel ? (
+          <p className="hint hint-strong">
+            Formatting {textSel.end - textSel.start} selected character{textSel.end - textSel.start === 1 ? '' : 's'}.
+            Click the page background when you're done.
+          </p>
+        ) : editing ? (
+          <p className="hint">Select words on the page to format just those. Settings here apply to the whole text box.</p>
+        ) : (
+          <>
+            <button type="button" className="btn" onClick={onStartEdit}>
+              Edit text
             </button>
-          ))}
+            <p className="hint">Or double-click the text. Select words while typing to format just those.</p>
+          </>
+        )}
+        <div className="field">
+          <span className="field-label">Style</span>
+          <div className="seg">
+            {toggles.map(({ key, label }) => {
+              const on = styles.every((st) => st[key])
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  className={'seg-btn' + (on ? ' is-on' : '')}
+                  aria-pressed={on}
+                  onClick={() => set(key, !on)}
+                >
+                  {label}
+                </button>
+              )
+            })}
+          </div>
         </div>
-      </div>
-      <ColorField id="text-color" label="Colour" value={el.color} onChange={(c) => onPatch({ color: c }, 'color')} />
-      <div className="grid2">
-        <NumField id="text-x" label="X" unit="mm" value={el.x} onChange={(n) => onPatch({ x: n }, 'x')} />
-        <NumField id="text-y" label="Y" unit="mm" value={el.y} onChange={(n) => onPatch({ y: n }, 'y')} />
-        <NumField id="text-w" label="Width" unit="mm" min={5} value={el.w} onChange={(n) => onPatch({ w: Math.max(5, n) }, 'w')} />
-      </div>
-      <button type="button" className="btn btn-quiet" onClick={() => onPatch({ x: round1((PAGE_W - el.w) / 2) }, 'center')}>
-        Centre across page
-      </button>
-    </Section>
+        <div className="field">
+          <label className="field-label" htmlFor="text-font">Typeface</label>
+          <select
+            id="text-font"
+            value={font ?? ''}
+            style={{ fontFamily: font ? fontStack(font) : undefined }}
+            onChange={(e) => set('font', e.target.value)}
+          >
+            {font === null && <option value="" disabled>Mixed</option>}
+            {FONTS.map((f) => (
+              <option key={f.family} value={f.family} style={{ fontFamily: fontStack(f.family) }}>
+                {f.family}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="grid2">
+          <NumField
+            id="text-size"
+            label={size === null ? 'Size (mixed)' : 'Size'}
+            unit="pt"
+            step={1}
+            min={4}
+            value={size ?? styles[0].size}
+            onChange={(n) => set('size', Math.max(4, n))}
+          />
+          {!textSel && (
+            <NumField id="text-lh" label="Line spacing" unit="×" step={0.05} min={0.7} value={el.lineHeight} onChange={(n) => onPatch({ lineHeight: Math.max(0.7, n) }, 'lh')} />
+          )}
+        </div>
+        <ColorField
+          id="text-color"
+          label={color === null ? 'Colour (mixed)' : 'Colour'}
+          value={color ?? styles[0].color}
+          onChange={(c) => set('color', c)}
+        />
+      </Section>
+      {!textSel && (
+        <Section title="Text box">
+          <div className="field">
+            <span className="field-label">Background</span>
+            <div className="seg">
+              <button type="button" className={'seg-btn' + (!el.fill ? ' is-on' : '')} aria-pressed={!el.fill} onClick={() => onPatch({ fill: undefined }, 'fill')}>
+                None
+              </button>
+              <button
+                type="button"
+                className={'seg-btn' + (el.fill ? ' is-on' : '')}
+                aria-pressed={!!el.fill}
+                onClick={() => !el.fill && onPatch({ fill: '#ffffff', padding: el.padding ?? 3 }, 'fill')}
+              >
+                Filled box
+              </button>
+            </div>
+          </div>
+          {el.fill && (
+            <>
+              <ColorField id="text-fill" label="Box colour" value={el.fill} onChange={(c) => onPatch({ fill: c }, 'fill')} />
+              <NumField
+                id="text-pad"
+                label="Padding around text"
+                unit="mm"
+                min={0}
+                value={el.padding ?? 0}
+                onChange={(n) => onPatch({ padding: Math.max(0, n) }, 'pad')}
+              />
+            </>
+          )}
+          <div className="field">
+            <span className="field-label">Align</span>
+            <div className="seg">
+              {aligns.map((a) => (
+                <button key={a.v} type="button" className={'seg-btn' + (el.align === a.v ? ' is-on' : '')} aria-pressed={el.align === a.v} onClick={() => onPatch({ align: a.v }, 'align')}>
+                  {a.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="grid2">
+            <NumField id="text-x" label="X" unit="mm" value={el.x} onChange={(n) => onPatch({ x: n }, 'x')} />
+            <NumField id="text-y" label="Y" unit="mm" value={el.y} onChange={(n) => onPatch({ y: n }, 'y')} />
+            <NumField id="text-w" label="Width" unit="mm" min={5} value={el.w} onChange={(n) => onPatch({ w: Math.max(5, n) }, 'w')} />
+          </div>
+          <button type="button" className="btn btn-quiet" onClick={() => onPatch({ x: round1((PAGE_W - el.w) / 2) }, 'center')}>
+            Centre across page
+          </button>
+        </Section>
+      )}
+    </>
   )
 }
 
@@ -283,7 +367,8 @@ function ImagePanel({ selected, bleedMm, onPatch, onReplaceImage }: Props) {
   )
 }
 
-function ArrangePanel({ selectedPage, onLayer, onOtherSide, onDuplicate, onDelete }: Props) {
+function ArrangePanel({ flyer, selectedPage, textSel, onLayer, onOtherSide, onDuplicate, onDelete }: Props) {
+  if (textSel) return null
   const other = 1 - selectedPage
   return (
     <Section title="Arrange">
@@ -296,9 +381,11 @@ function ArrangePanel({ selectedPage, onLayer, onOtherSide, onDuplicate, onDelet
           <button type="button" className="seg-btn" onClick={() => onLayer('back')} title="Behind everything">To back</button>
         </div>
       </div>
-      <button type="button" className="btn" onClick={onOtherSide}>
-        Move to page {other + 1} ({PAGE_NAMES[other].toLowerCase()})
-      </button>
+      {flyer.pages.length > 1 && (
+        <button type="button" className="btn" onClick={onOtherSide}>
+          Move to page {other + 1} ({PAGE_NAMES[other].toLowerCase()})
+        </button>
+      )}
       <div className="btn-row">
         <button type="button" className="btn" onClick={onDuplicate}>Duplicate</button>
         <button type="button" className="btn btn-danger" onClick={onDelete}>Delete</button>

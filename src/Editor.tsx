@@ -1,41 +1,62 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
-import './App.css'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react'
 import {
-  emptyFlyer,
+  blankPage,
   newText,
   PAGE_H,
   PAGE_NAMES,
   PAGE_W,
   round1,
-  sampleFlyer,
   uid,
   type Flyer,
   type FlyerEl,
   type ImageEl,
+  type TextEl,
 } from './flyer'
 import PageStage from './PageStage'
 import Inspector from './Inspector'
 import { exportPdf, exportPngs, readImageFile } from './render'
-import { loadFlyer, saveFlyer } from './storage'
+import { applyStyle, type StylePatch } from './runs'
+import type { TextSel } from './RichText'
 
 const BLEED_MM = 3
 const PAD = 40
 const LABEL_H = 36
+const NARROW = '(max-width: 820px)'
 
 export type LayerMove = 'front' | 'forward' | 'backward' | 'back'
 
-export default function App() {
-  const [flyer, setFlyer] = useState<Flyer>(sampleFlyer)
+function useNarrow(): boolean {
+  return useSyncExternalStore(
+    (cb) => {
+      const mq = window.matchMedia(NARROW)
+      mq.addEventListener('change', cb)
+      return () => mq.removeEventListener('change', cb)
+    },
+    () => window.matchMedia(NARROW).matches,
+  )
+}
+
+interface Props {
+  projectName: string
+  initial: Flyer
+  onFlyerChange: (f: Flyer) => void
+  sidebarOpen: boolean
+  onToggleSidebar: () => void
+}
+
+export default function Editor({ projectName, initial, onFlyerChange, sidebarOpen, onToggleSidebar }: Props) {
+  const [flyer, setFlyer] = useState<Flyer>(initial)
   const [activePage, setActivePage] = useState(0)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [textSel, setTextSel] = useState<TextSel | null>(null)
   const [showGuides, setShowGuides] = useState(true)
   const [bleed, setBleed] = useState(false)
   const [busy, setBusy] = useState<string | null>(null)
   const [toast, setToast] = useState<string | null>(null)
-  const [loaded, setLoaded] = useState(false)
   const [hist, setHist] = useState({ undo: false, redo: false })
   const [ws, setWs] = useState({ w: 900, h: 700 })
+  const narrow = useNarrow()
 
   const flyerRef = useRef(flyer)
   const past = useRef<Flyer[]>([])
@@ -46,25 +67,8 @@ export default function App() {
 
   useEffect(() => {
     flyerRef.current = flyer
-  }, [flyer])
-
-  // ---- persistence -------------------------------------------------------
-  useEffect(() => {
-    loadFlyer<Flyer>()
-      .then((f) => {
-        if (f?.pages?.length === 2) setFlyer(f)
-      })
-      .catch(() => {})
-      .finally(() => setLoaded(true))
-  }, [])
-
-  useEffect(() => {
-    if (!loaded) return
-    const t = setTimeout(() => {
-      saveFlyer(flyer).catch(() => showToast('Autosave failed. Download a PDF to keep your work.'))
-    }, 400)
-    return () => clearTimeout(t)
-  }, [flyer, loaded])
+    if (flyer !== initial) onFlyerChange(flyer)
+  }, [flyer, initial, onFlyerChange])
 
   // ---- workspace size -> page scale ---------------------------------------
   useEffect(() => {
@@ -75,11 +79,12 @@ export default function App() {
     return () => ro.disconnect()
   }, [])
 
-  const twoUp = ws.w >= 620
-  const scale = twoUp
-    ? Math.min((ws.w - PAD * 3) / (PAGE_W * 2), (ws.h - PAD * 2 - LABEL_H) / PAGE_H)
-    : (ws.w - PAD * 2) / PAGE_W
-  const s = Math.max(1.2, Math.min(scale, 7))
+  const pageCount = flyer.pages.length
+  const cols = pageCount === 2 && ws.w >= 620 ? 2 : 1
+  const fitW = (ws.w - (narrow ? 32 : PAD * (cols + 1))) / (PAGE_W * cols)
+  const fitH = (ws.h - PAD * 2 - LABEL_H) / PAGE_H
+  // On narrow screens the workspace grows with its content, so only width can set the scale.
+  const s = Math.max(1.2, Math.min(narrow ? fitW : Math.min(fitW, fitH), 7))
 
   // ---- history --------------------------------------------------------------
   const syncHist = () => setHist({ undo: past.current.length > 0, redo: future.current.length > 0 })
@@ -98,23 +103,21 @@ export default function App() {
     syncHist()
   }, [])
 
-  function undo() {
-    const prev = past.current.pop()
-    if (!prev) return
-    future.current.push(flyerRef.current)
-    lastKey.current = null
-    setFlyer(prev)
+  function stopEditing() {
     setEditingId(null)
-    syncHist()
+    setTextSel(null)
   }
 
-  function redo() {
-    const next = future.current.pop()
-    if (!next) return
-    past.current.push(flyerRef.current)
+  function travel(redo: boolean) {
+    const from = redo ? future : past
+    const to = redo ? past : future
+    const target = from.current.pop()
+    if (!target) return
+    to.current.push(flyerRef.current)
     lastKey.current = null
-    setFlyer(next)
-    setEditingId(null)
+    setFlyer(target)
+    setActivePage((p) => Math.min(p, target.pages.length - 1))
+    stopEditing()
     syncHist()
   }
 
@@ -130,6 +133,10 @@ export default function App() {
 
   const selectedPage = flyer.pages.findIndex((p) => p.elements.some((el) => el.id === selectedId))
   const selected = selectedPage >= 0 ? flyer.pages[selectedPage].elements.find((el) => el.id === selectedId)! : null
+  const editingSel =
+    selected?.type === 'text' && editingId === selected.id && textSel && textSel.start !== textSel.end
+      ? { start: Math.min(textSel.start, textSel.end), end: Math.max(textSel.start, textSel.end) }
+      : null
 
   function showToast(msg: string) {
     setToast(msg)
@@ -183,7 +190,7 @@ export default function App() {
     checkpoint()
     editPage(selectedPage, (els) => els.filter((el) => el.id !== selected.id))
     setSelectedId(null)
-    setEditingId(null)
+    stopEditing()
   }
 
   function duplicateSelected() {
@@ -211,7 +218,7 @@ export default function App() {
   }
 
   function moveToOtherSide() {
-    if (!selected) return
+    if (!selected || pageCount < 2) return
     checkpoint()
     const from = selectedPage
     const to = 1 - from
@@ -226,26 +233,42 @@ export default function App() {
     showToast(`Moved to page ${to + 1} (${PAGE_NAMES[to].toLowerCase()})`)
   }
 
+  function setPageCount(n: number) {
+    if (n === pageCount) return
+    checkpoint()
+    if (n === 1) {
+      const dropped = flyer.pages[1]
+      setFlyer((f) => ({ pages: f.pages.slice(0, 1) }))
+      setActivePage(0)
+      if (selectedPage === 1) {
+        setSelectedId(null)
+        stopEditing()
+      }
+      if (dropped.elements.length) showToast('Page 2 removed. Undo brings it back.')
+    } else {
+      setFlyer((f) => ({ pages: [...f.pages, blankPage()] }))
+    }
+  }
+
   function setBackground(index: number, color: string) {
     checkpoint(`bg${index}`)
     setFlyer((f) => ({ pages: f.pages.map((p, i) => (i === index ? { ...p, background: color } : p)) }))
   }
 
-  function startOver() {
-    checkpoint()
-    setFlyer(emptyFlyer())
-    setSelectedId(null)
-    setEditingId(null)
-    setActivePage(0)
+  /** Formats the selected words while editing text. */
+  function formatSelection(patch: StylePatch, key: string) {
+    if (selected?.type !== 'text' || !editingSel) return
+    checkpoint(`${selected.id}:fmt:${key}`)
+    updateEl(selected.id, { runs: applyStyle(selected.runs, editingSel.start, editingSel.end, patch) } as Partial<TextEl>)
   }
 
   async function runExport(kind: 'pdf' | 'png') {
-    setEditingId(null)
+    stopEditing()
     setBusy(kind)
     try {
       const b = bleed ? BLEED_MM : 0
-      if (kind === 'pdf') await exportPdf(flyerRef.current, b)
-      else await exportPngs(flyerRef.current, b)
+      if (kind === 'pdf') await exportPdf(flyerRef.current, b, projectName)
+      else await exportPngs(flyerRef.current, b, projectName)
     } catch (err) {
       showToast(`Export failed: ${(err as Error).message}`)
     } finally {
@@ -261,16 +284,15 @@ export default function App() {
       const mod = e.metaKey || e.ctrlKey
       if (mod && e.key.toLowerCase() === 'z') {
         e.preventDefault()
-        if (e.shiftKey) redo()
-        else undo()
+        travel(e.shiftKey)
         return
       }
       if (mod && e.key.toLowerCase() === 'y') {
         e.preventDefault()
-        redo()
+        travel(true)
         return
       }
-      if (!selected) return
+      if (!selected || editingId) return
       if (mod && e.key.toLowerCase() === 'd') {
         e.preventDefault()
         duplicateSelected()
@@ -297,14 +319,41 @@ export default function App() {
   })
 
   return (
-    <div className="app">
+    <div className="editor">
       <header className="topbar">
         <div className="brand">
-          <span className="brand-name">A6 Flyer</span>
-          <span className="brand-meta">105 × 148 mm · portrait · 2 pages</span>
+          <button
+            type="button"
+            className="btn btn-quiet btn-icon"
+            onClick={onToggleSidebar}
+            aria-pressed={sidebarOpen}
+            title={sidebarOpen ? 'Hide projects' : 'Show projects'}
+          >
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+              <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor" />
+              <path d="M6 2.5v11" stroke="currentColor" />
+            </svg>
+          </button>
+          <div className="brand-text">
+            <span className="brand-name">{projectName}</span>
+            <span className="brand-meta">A6 · 105 × 148 mm</span>
+          </div>
         </div>
 
         <div className="toolgroup">
+          <div className="seg seg-inline" role="group" aria-label="Pages">
+            {[1, 2].map((n) => (
+              <button
+                key={n}
+                type="button"
+                className={'seg-btn' + (pageCount === n ? ' is-on' : '')}
+                aria-pressed={pageCount === n}
+                onClick={() => setPageCount(n)}
+              >
+                {n === 1 ? '1 page' : '2 pages'}
+              </button>
+            ))}
+          </div>
           <button type="button" className="btn" onClick={addText}>
             <span aria-hidden="true" className="btn-glyph">T</span> Add text
           </button>
@@ -324,14 +373,13 @@ export default function App() {
               if (files.length) void addImages(files, activePage)
             }}
           />
-          <span className="toolgroup-note">to page {activePage + 1}</span>
         </div>
 
         <div className="toolgroup">
-          <button type="button" className="btn btn-quiet" onClick={undo} disabled={!hist.undo} title="Undo (⌘Z)">
+          <button type="button" className="btn btn-quiet" onClick={() => travel(false)} disabled={!hist.undo} title="Undo (⌘Z)">
             Undo
           </button>
-          <button type="button" className="btn btn-quiet" onClick={redo} disabled={!hist.redo} title="Redo (⇧⌘Z)">
+          <button type="button" className="btn btn-quiet" onClick={() => travel(true)} disabled={!hist.redo} title="Redo (⇧⌘Z)">
             Redo
           </button>
           <label className="check">
@@ -346,7 +394,7 @@ export default function App() {
             3 mm bleed
           </label>
           <button type="button" className="btn" disabled={!!busy} onClick={() => runExport('png')}>
-            {busy === 'png' ? 'Rendering…' : 'PNGs'}
+            {busy === 'png' ? 'Rendering…' : 'PNG'}
           </button>
           <button type="button" className="btn btn-primary" disabled={!!busy} onClick={() => runExport('pdf')}>
             {busy === 'pdf' ? 'Rendering…' : 'Download PDF'}
@@ -356,11 +404,11 @@ export default function App() {
 
       <main
         ref={workspaceRef}
-        className={'workspace' + (twoUp ? ' two-up' : '')}
+        className={'workspace' + (cols === 2 ? ' two-up' : '')}
         style={{ '--cm': `${s * 10}px` } as CSSProperties}
         onPointerDown={() => {
           setSelectedId(null)
-          setEditingId(null)
+          stopEditing()
         }}
       >
         {flyer.pages.map((page, i) => (
@@ -368,27 +416,34 @@ export default function App() {
             key={i}
             page={page}
             index={i}
+            pageCount={pageCount}
             scale={s}
             active={activePage === i}
             selectedId={selectedPage === i ? selectedId : null}
             editingId={editingId}
             showGuides={showGuides}
+            textSel={textSel}
+            onTextSel={setTextSel}
+            onUndo={travel}
             onActivate={() => {
               setActivePage(i)
               setSelectedId(null)
+              stopEditing()
             }}
             onSelect={(id) => {
               setActivePage(i)
               setSelectedId(id)
-              if (id !== editingId) setEditingId(null)
+              if (id !== editingId) stopEditing()
             }}
             onChange={updateEl}
             onCheckpoint={checkpoint}
             onStartEdit={(id) => {
+              if (editingId === id) return
               checkpoint()
+              setTextSel(null)
               setEditingId(id)
             }}
-            onEndEdit={() => setEditingId(null)}
+            onEndEdit={stopEditing}
             onDropFiles={(files, x, y) => void addImages(files, i, { x, y })}
           />
         ))}
@@ -400,6 +455,14 @@ export default function App() {
         selected={selected}
         selectedPage={selectedPage}
         bleedMm={bleed ? BLEED_MM : 0}
+        editing={!!selected && editingId === selected.id}
+        textSel={editingSel}
+        onFormat={formatSelection}
+        onStartEdit={() => {
+          if (selected?.type !== 'text') return
+          checkpoint()
+          setEditingId(selected.id)
+        }}
         onPatch={(patch, key) => {
           if (!selected) return
           checkpoint(`${selected.id}:${key}`)
@@ -410,7 +473,6 @@ export default function App() {
         onOtherSide={moveToOtherSide}
         onDuplicate={duplicateSelected}
         onDelete={deleteSelected}
-        onStartOver={startOver}
         onReplaceImage={async (file) => {
           if (selected?.type !== 'image') return
           try {

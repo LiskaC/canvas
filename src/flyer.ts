@@ -21,17 +21,36 @@ export interface ImageEl extends BaseEl {
   opacity: number
 }
 
+/** Character formatting. On a run, each key overrides the text box's own setting. */
+export interface RunStyle {
+  bold?: boolean
+  italic?: boolean
+  underline?: boolean
+  color?: string
+  size?: number // points
+  font?: string
+}
+
+export interface Run extends RunStyle {
+  text: string
+}
+
+export type TextStyle = Required<RunStyle>
+
 // Text height is not stored: it follows from the width, font and content.
 export interface TextEl extends BaseEl {
   type: 'text'
-  text: string
+  runs: Run[]
   font: string
   size: number // points
   color: string
   bold: boolean
   italic: boolean
+  underline: boolean
   align: Align
   lineHeight: number
+  fill?: string // box background; none when unset
+  padding?: number // mm the background extends past the text on every side
 }
 
 export type FlyerEl = ImageEl | TextEl
@@ -42,7 +61,7 @@ export interface Page {
 }
 
 export interface Flyer {
-  pages: Page[] // [front, back]
+  pages: Page[] // [front] or [front, back]
 }
 
 export const FONTS: { family: string; fallback: string }[] = [
@@ -60,10 +79,39 @@ export function fontStack(family: string): string {
   return `"${family}", ${f?.fallback ?? 'sans-serif'}`
 }
 
-/** CSS/canvas font shorthand for a text element at the given scale. */
-export function cssFont(el: TextEl, pxPerMm: number): string {
-  const px = el.size * PT_TO_MM * pxPerMm
-  return `${el.italic ? 'italic ' : ''}${el.bold ? 700 : 400} ${px}px ${fontStack(el.font)}`
+/** The text box's own style, used where a run sets nothing. */
+export function boxStyle(el: TextEl): TextStyle {
+  const { bold, italic, underline, color, size, font } = el
+  return { bold, italic, underline, color, size, font }
+}
+
+export function resolveStyle(el: TextEl, run: RunStyle): TextStyle {
+  return {
+    bold: run.bold ?? el.bold,
+    italic: run.italic ?? el.italic,
+    underline: run.underline ?? el.underline,
+    color: run.color ?? el.color,
+    size: run.size ?? el.size,
+    font: run.font ?? el.font,
+  }
+}
+
+/** CSS/canvas font shorthand at the given scale. */
+export function cssFont(st: TextStyle, pxPerMm: number): string {
+  const px = st.size * PT_TO_MM * pxPerMm
+  return `${st.italic ? 'italic ' : ''}${st.bold ? 700 : 400} ${px}px ${fontStack(st.font)}`
+}
+
+/** Inline style for one run, as plain strings so it works for React and the DOM alike. */
+export function spanStyle(st: TextStyle, pxPerMm: number): Record<string, string> {
+  return {
+    fontFamily: fontStack(st.font),
+    fontSize: `${st.size * PT_TO_MM * pxPerMm}px`,
+    fontWeight: st.bold ? '700' : '400',
+    fontStyle: st.italic ? 'italic' : 'normal',
+    color: st.color,
+    textDecoration: st.underline ? 'underline' : 'none',
+  }
 }
 
 export function uid(): string {
@@ -72,31 +120,48 @@ export function uid(): string {
 
 export const round1 = (n: number) => Math.round(n * 10) / 10
 
-export function newText(partial: Partial<TextEl> = {}): TextEl {
+export function newText(partial: Partial<TextEl> & { text?: string } = {}): TextEl {
+  const { text = 'Your text here', ...rest } = partial
   return {
     id: uid(),
     type: 'text',
     x: 12,
     y: 60,
     w: 81,
-    text: 'Your text here',
+    runs: [{ text }],
     font: 'Work Sans',
     size: 18,
     color: '#1b1f1d',
     bold: false,
     italic: false,
+    underline: false,
     align: 'center',
     lineHeight: 1.2,
-    ...partial,
+    ...rest,
   }
 }
 
-export function emptyFlyer(): Flyer {
+export function blankPage(): Page {
+  return { background: '#ffffff', elements: [] }
+}
+
+export function emptyFlyer(pageCount = 2): Flyer {
+  return { pages: Array.from({ length: pageCount }, blankPage) }
+}
+
+/** Brings flyers saved by older versions up to the current shape. */
+export function migrateFlyer(f: Flyer): Flyer {
   return {
-    pages: [
-      { background: '#ffffff', elements: [] },
-      { background: '#ffffff', elements: [] },
-    ],
+    pages: f.pages.map((p) => ({
+      ...p,
+      elements: p.elements.map((el) => {
+        if (el.type !== 'text') return el
+        const old = el as TextEl & { text?: string }
+        if (old.runs) return el
+        const { text = '', ...rest } = old
+        return { ...rest, runs: [{ text }], underline: false }
+      }),
+    })),
   }
 }
 
@@ -162,11 +227,16 @@ export function sampleFlyer(): Flyer {
           }),
           newText({
             x: 10, y: 30, w: 85, size: 10.5, color: '#1b1f1d', align: 'left', lineHeight: 1.45,
-            text:
-              '40+ local makers: ceramics, prints, textiles and wood\n\n' +
-              'Live letterpress demos at 11am and 2pm\n\n' +
-              'Street food from the Riverside kitchens\n\n' +
-              'Free entry · Dogs welcome',
+            runs: [
+              { text: '40+ local makers', bold: true },
+              { text: ': ceramics, prints, textiles and wood\n\n' },
+              { text: 'Live letterpress demos', bold: true },
+              { text: ' at 11am and 2pm\n\n' },
+              { text: 'Street food', bold: true },
+              { text: ' from the Riverside kitchens\n\n' },
+              { text: 'Free entry', bold: true, color: '#c8166b' },
+              { text: ' · Dogs welcome' },
+            ],
           }),
           newText({
             x: 10, y: 128, w: 85, text: 'riversidemakers.example', font: 'Space Mono',
